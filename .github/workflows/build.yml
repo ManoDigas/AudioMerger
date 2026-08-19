@@ -133,6 +133,7 @@ jobs:
               implementation("androidx.compose.material:material-icons-extended")
 
               implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
+              implementation("com.arthenica:smart-exception-java:0.2.1")
 
               debugImplementation("androidx.compose.ui:ui-tooling")
           }
