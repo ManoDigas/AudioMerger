@@ -427,7 +427,8 @@ jobs:
 
                               val processedMs =
                                   statistics.time
-                                      .coerceAtLeast(0L)
+                                    .toLong()
+                                    .coerceAtLeast(0L)
 
                               val progress =
                                   if (
