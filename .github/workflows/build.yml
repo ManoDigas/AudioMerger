@@ -86,8 +86,9 @@ jobs:
                   applicationId = "com.example.audiomerger"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "1.1"
+
+                  versionCode = 3
+                  versionName = "1.2"
               }
 
               buildTypes {
@@ -133,6 +134,8 @@ jobs:
               implementation("androidx.compose.material:material-icons-extended")
 
               implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
+
+              // Necessário para o FFmpegKit no Android.
               implementation("com.arthenica:smart-exception-java:0.2.1")
 
               debugImplementation("androidx.compose.ui:ui-tooling")
@@ -203,15 +206,18 @@ jobs:
           package com.example.audiomerger
 
           import android.content.Context
+          import android.media.MediaMetadataRetriever
           import android.net.Uri
           import android.provider.OpenableColumns
           import com.arthenica.ffmpegkit.FFmpegKit
           import com.arthenica.ffmpegkit.ReturnCode
           import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.suspendCancellableCoroutine
           import kotlinx.coroutines.withContext
           import java.io.File
           import java.io.FileOutputStream
           import java.util.UUID
+          import kotlin.coroutines.resume
 
           data class AudioItem(
               val id: String = UUID.randomUUID().toString(),
@@ -221,7 +227,8 @@ jobs:
 
           data class MergeResult(
               val file: File? = null,
-              val error: String? = null
+              val error: String? = null,
+              val mode: String? = null
           )
 
           object AudioMerger {
@@ -232,6 +239,7 @@ jobs:
               ): AudioItem? = withContext(Dispatchers.IO) {
 
                   try {
+
                       var displayName =
                           "audio_${System.currentTimeMillis()}.m4a"
 
@@ -250,17 +258,26 @@ jobs:
                                       OpenableColumns.DISPLAY_NAME
                                   )
 
-                              if (index >= 0 && cursor.moveToFirst()) {
+                              if (
+                                  index >= 0 &&
+                                  cursor.moveToFirst()
+                              ) {
+
                                   cursor.getString(index)?.let {
                                       displayName = it
                                   }
                               }
                           }
 
+                      /*
+                       * Também removemos aspas simples.
+                       * Isso deixa o caminho seguro para o arquivo
+                       * de concatenação usado no modo rápido.
+                       */
                       val safeName =
                           displayName
                               .replace(
-                                  Regex("[\\\\/:*?\"<>|]"),
+                                  Regex("[\\\\/:*?\"<>|'\\n\\r]"),
                                   "_"
                               )
                               .take(120)
@@ -277,16 +294,21 @@ jobs:
                               ?: return@withContext null
 
                       input.use { source ->
-                          FileOutputStream(destination).use { output ->
-                              source.copyTo(output)
-                          }
+
+                          FileOutputStream(destination)
+                              .use { output ->
+
+                                  source.copyTo(output)
+                              }
                       }
 
                       if (
                           !destination.exists() ||
                           destination.length() <= 0L
                       ) {
+
                           destination.delete()
+
                           return@withContext null
                       }
 
@@ -296,166 +318,575 @@ jobs:
                       )
 
                   } catch (e: Exception) {
+
                       null
                   }
               }
 
-              suspend fun mergeAudios(
-                  context: Context,
-                  audioList: List<AudioItem>
-              ): MergeResult = withContext(Dispatchers.IO) {
+              /*
+               * Tenta descobrir a duração pelo Android.
+               * Isso é usado somente para calcular a porcentagem.
+               *
+               * Se algum arquivo não revelar sua duração,
+               * a mesclagem continua funcionando normalmente.
+               */
+              private fun getDurationMs(
+                  file: File
+              ): Long? {
 
-                  if (audioList.isEmpty()) {
-                      return@withContext MergeResult(
-                          error = "Nenhum áudio foi adicionado."
+                  val retriever =
+                      MediaMetadataRetriever()
+
+                  return try {
+
+                      retriever.setDataSource(
+                          file.absolutePath
                       )
-                  }
 
-                  val missingFiles =
-                      audioList.filter {
-                          !it.file.exists() ||
-                          it.file.length() <= 0L
+                      retriever.extractMetadata(
+                          MediaMetadataRetriever
+                              .METADATA_KEY_DURATION
+                      )?.toLongOrNull()
+
+                  } catch (e: Exception) {
+
+                      null
+
+                  } finally {
+
+                      try {
+                          retriever.release()
+                      } catch (_: Exception) {
                       }
+                  }
+              }
 
-                  if (missingFiles.isNotEmpty()) {
-                      return@withContext MergeResult(
-                          error =
-                              "Um ou mais arquivos de áudio não estão " +
-                              "mais disponíveis no cache.\n\n" +
-                              missingFiles.joinToString("\n") {
-                                  "• ${it.name}"
-                              }
-                      )
+              private fun getTotalDurationMs(
+                  audioList: List<AudioItem>
+              ): Long? {
+
+                  var total = 0L
+
+                  audioList.forEach { item ->
+
+                      val duration =
+                          getDurationMs(item.file)
+                              ?: return null
+
+                      total += duration
                   }
 
-                  val outputFile =
+                  return if (total > 0L) {
+                      total
+                  } else {
+                      null
+                  }
+              }
+
+              /*
+               * Executa o FFmpeg de forma assíncrona.
+               *
+               * O callback de estatísticas informa quantos
+               * milissegundos já foram processados.
+               */
+              private suspend fun executeFFmpeg(
+                  arguments: Array<String>,
+                  totalDurationMs: Long?,
+                  progressStart: Float,
+                  progressEnd: Float,
+                  phase: String,
+                  onProgress: (
+                      progress: Float?,
+                      processedMs: Long,
+                      totalMs: Long?,
+                      phase: String
+                  ) -> Unit
+              ) = suspendCancellableCoroutine { continuation ->
+
+                  var completed = false
+
+                  val session =
+                      FFmpegKit.executeWithArgumentsAsync(
+                          arguments,
+
+                          { finishedSession ->
+
+                              if (!completed) {
+
+                                  completed = true
+
+                                  continuation.resume(
+                                      finishedSession
+                                  )
+                              }
+                          },
+
+                          null,
+
+                          { statistics ->
+
+                              val processedMs =
+                                  statistics.time
+                                      .coerceAtLeast(0L)
+
+                              val progress =
+                                  if (
+                                      totalDurationMs != null &&
+                                      totalDurationMs > 0L
+                                  ) {
+
+                                      val local =
+                                          (
+                                              processedMs.toFloat() /
+                                              totalDurationMs.toFloat()
+                                          ).coerceIn(
+                                              0f,
+                                              1f
+                                          )
+
+                                      progressStart +
+                                          (
+                                              progressEnd -
+                                              progressStart
+                                          ) * local
+
+                                  } else {
+
+                                      null
+                                  }
+
+                              onProgress(
+                                  progress,
+                                  processedMs,
+                                  totalDurationMs,
+                                  phase
+                              )
+                          }
+                      )
+
+                  continuation.invokeOnCancellation {
+
+                      try {
+                          FFmpegKit.cancel(
+                              session.sessionId
+                          )
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+
+              /*
+               * MODO RÁPIDO
+               *
+               * Tenta concatenar os arquivos sem recodificar.
+               * Quando funciona, normalmente termina muito
+               * mais rápido porque não precisa decodificar
+               * e codificar novamente todo o áudio.
+               */
+              private suspend fun tryFastMerge(
+                  context: Context,
+                  audioList: List<AudioItem>,
+                  outputFile: File,
+                  totalDurationMs: Long?,
+                  onProgress: (
+                      Float?,
+                      Long,
+                      Long?,
+                      String
+                  ) -> Unit
+              ): Boolean {
+
+                  val concatFile =
                       File(
                           context.cacheDir,
-                          "Nota_Mesclada_${System.currentTimeMillis()}.m4a"
+                          "concat_${UUID.randomUUID()}.txt"
                       )
 
-                  if (outputFile.exists()) {
-                      outputFile.delete()
+                  try {
+
+                      concatFile.bufferedWriter()
+                          .use { writer ->
+
+                              audioList.forEach { item ->
+
+                                  writer.append(
+                                      "file '${item.file.absolutePath}'"
+                                  )
+
+                                  writer.newLine()
+                              }
+                          }
+
+                      onProgress(
+                          0.02f,
+                          0L,
+                          totalDurationMs,
+                          "Tentando mesclagem rápida..."
+                      )
+
+                      val arguments =
+                          arrayOf(
+                              "-hide_banner",
+
+                              "-f",
+                              "concat",
+
+                              "-safe",
+                              "0",
+
+                              "-i",
+                              concatFile.absolutePath,
+
+                              "-vn",
+
+                              "-c:a",
+                              "copy",
+
+                              "-movflags",
+                              "+faststart",
+
+                              "-y",
+
+                              outputFile.absolutePath
+                          )
+
+                      val session =
+                          executeFFmpeg(
+                              arguments =
+                                  arguments,
+
+                              totalDurationMs =
+                                  totalDurationMs,
+
+                              progressStart =
+                                  0.02f,
+
+                              progressEnd =
+                                  0.90f,
+
+                              phase =
+                                  "Mesclagem rápida...",
+
+                              onProgress =
+                                  onProgress
+                          )
+
+                      return (
+                          ReturnCode.isSuccess(
+                              session.returnCode
+                          ) &&
+                          outputFile.exists() &&
+                          outputFile.length() > 0L
+                      )
+
+                  } catch (_: Throwable) {
+
+                      return false
+
+                  } finally {
+
+                      concatFile.delete()
+                  }
+              }
+
+              /*
+               * MODO COMPATÍVEL
+               *
+               * É o método mais pesado, porém aceita arquivos
+               * com configurações diferentes.
+               *
+               * Todos são convertidos para:
+               * AAC / 44.1 kHz / estéreo.
+               */
+              private suspend fun compatibleMerge(
+                  audioList: List<AudioItem>,
+                  outputFile: File,
+                  totalDurationMs: Long?,
+                  onProgress: (
+                      Float?,
+                      Long,
+                      Long?,
+                      String
+                  ) -> Unit
+              ): MergeResult {
+
+                  val arguments =
+                      mutableListOf<String>()
+
+                  arguments += "-hide_banner"
+
+                  audioList.forEach { item ->
+
+                      arguments += "-i"
+                      arguments += item.file.absolutePath
                   }
 
-                  try {
-                      val arguments =
-                          mutableListOf<String>()
+                  val filterBuilder =
+                      StringBuilder()
 
-                      arguments += "-hide_banner"
+                  audioList.indices.forEach { index ->
 
-                      audioList.forEach { item ->
-                          arguments += "-i"
-                          arguments += item.file.absolutePath
-                      }
-
-                      /*
-                       * Normaliza todas as entradas para:
-                       * - 44.1 kHz
-                       * - estéreo
-                       * - formato fltp
-                       *
-                       * Isso evita várias falhas de concatenação quando
-                       * os arquivos foram gravados com configurações
-                       * diferentes.
-                       */
-
-                      val filterBuilder =
-                          StringBuilder()
-
-                      audioList.indices.forEach { index ->
-
-                          filterBuilder.append(
-                              "[$index:a]" +
+                      filterBuilder.append(
+                          "[$index:a]" +
                               "aresample=44100," +
                               "aformat=" +
                               "sample_fmts=fltp:" +
                               "sample_rates=44100:" +
                               "channel_layouts=stereo" +
                               "[a$index];"
-                          )
-                      }
+                      )
+                  }
 
-                      audioList.indices.forEach { index ->
-                          filterBuilder.append("[a$index]")
-                      }
+                  audioList.indices.forEach { index ->
 
                       filterBuilder.append(
-                          "concat=n=${audioList.size}:" +
+                          "[a$index]"
+                      )
+                  }
+
+                  filterBuilder.append(
+                      "concat=n=${audioList.size}:" +
                           "v=0:a=1[outa]"
+                  )
+
+                  arguments += "-filter_complex"
+                  arguments += filterBuilder.toString()
+
+                  arguments += "-map"
+                  arguments += "[outa]"
+
+                  arguments += "-vn"
+
+                  arguments += "-c:a"
+                  arguments += "aac"
+
+                  /*
+                   * 160 kbps é mais leve que 192 kbps
+                   * e continua sendo uma qualidade alta
+                   * para notas de voz e gravações.
+                   */
+                  arguments += "-b:a"
+                  arguments += "160k"
+
+                  arguments += "-ar"
+                  arguments += "44100"
+
+                  arguments += "-ac"
+                  arguments += "2"
+
+                  arguments += "-movflags"
+                  arguments += "+faststart"
+
+                  arguments += "-y"
+
+                  arguments += outputFile.absolutePath
+
+                  onProgress(
+                      0f,
+                      0L,
+                      totalDurationMs,
+                      "Convertendo áudios..."
+                  )
+
+                  val session =
+                      executeFFmpeg(
+                          arguments =
+                              arguments.toTypedArray(),
+
+                          totalDurationMs =
+                              totalDurationMs,
+
+                          progressStart =
+                              0f,
+
+                          progressEnd =
+                              0.98f,
+
+                          phase =
+                              "Convertendo e mesclando...",
+
+                          onProgress =
+                              onProgress
                       )
 
-                      arguments += "-filter_complex"
-                      arguments += filterBuilder.toString()
-
-                      arguments += "-map"
-                      arguments += "[outa]"
-
-                      arguments += "-vn"
-
-                      arguments += "-c:a"
-                      arguments += "aac"
-
-                      arguments += "-b:a"
-                      arguments += "192k"
-
-                      arguments += "-ar"
-                      arguments += "44100"
-
-                      arguments += "-ac"
-                      arguments += "2"
-
-                      arguments += "-movflags"
-                      arguments += "+faststart"
-
-                      arguments += "-y"
-
-                      arguments += outputFile.absolutePath
-
-                      val session =
-                          FFmpegKit.executeWithArguments(
-                              arguments.toTypedArray()
-                          )
-
-                      val returnCode =
+                  if (
+                      ReturnCode.isSuccess(
                           session.returnCode
+                      ) &&
+                      outputFile.exists() &&
+                      outputFile.length() > 0L
+                  ) {
 
-                      if (
-                          ReturnCode.isSuccess(returnCode) &&
-                          outputFile.exists() &&
-                          outputFile.length() > 0L
-                      ) {
-                          return@withContext MergeResult(
-                              file = outputFile
-                          )
+                      onProgress(
+                          1f,
+                          totalDurationMs ?: 0L,
+                          totalDurationMs,
+                          "Concluído"
+                      )
+
+                      return MergeResult(
+                          file = outputFile,
+                          mode = "Compatível"
+                      )
+                  }
+
+                  outputFile.delete()
+
+                  val log =
+                      try {
+
+                          session.allLogsAsString
+                              ?.takeLast(10000)
+                              ?: "O FFmpeg não forneceu detalhes."
+
+                      } catch (_: Exception) {
+
+                          "Não foi possível recuperar o log."
                       }
 
-                      outputFile.delete()
+                  return MergeResult(
+                      error =
+                          """
+                          Falha ao processar os áudios.
 
-                      val ffmpegLog =
-                          try {
-                              session.allLogsAsString
-                                  ?.takeLast(10000)
-                                  ?: "O FFmpeg não forneceu detalhes."
-                          } catch (e: Exception) {
-                              "Não foi possível recuperar o log do FFmpeg."
-                          }
+                          Modo:
+                          Compatível
+
+                          Código do FFmpeg:
+                          ${session.returnCode}
+
+                          Arquivos:
+                          ${audioList.joinToString("\n") { "• ${it.name}" }}
+
+                          ----- LOG DO FFMPEG -----
+
+                          $log
+                          """.trimIndent()
+                  )
+              }
+
+              suspend fun mergeAudios(
+                  context: Context,
+                  audioList: List<AudioItem>,
+                  onProgress: (
+                      progress: Float?,
+                      processedMs: Long,
+                      totalMs: Long?,
+                      phase: String
+                  ) -> Unit
+              ): MergeResult = withContext(
+                  Dispatchers.IO
+              ) {
+
+                  if (audioList.isEmpty()) {
 
                       return@withContext MergeResult(
                           error =
-                              """
-                              Falha ao processar os áudios.
+                              "Nenhum áudio foi adicionado."
+                      )
+                  }
 
-                              Código do FFmpeg:
-                              $returnCode
+                  val missing =
+                      audioList.filter {
+                          !it.file.exists() ||
+                              it.file.length() <= 0L
+                      }
 
-                              Arquivos:
-                              ${audioList.joinToString("\n") { "• ${it.name}" }}
+                  if (missing.isNotEmpty()) {
 
-                              ----- LOG DO FFMPEG -----
+                      return@withContext MergeResult(
+                          error =
+                              "Alguns arquivos não estão mais " +
+                                  "disponíveis:\n\n" +
+                                  missing.joinToString("\n") {
+                                      "• ${it.name}"
+                                  }
+                      )
+                  }
 
-                              $ffmpegLog
-                              """.trimIndent()
+                  val totalDurationMs =
+                      getTotalDurationMs(
+                          audioList
+                      )
+
+                  val outputFile =
+                      File(
+                          context.cacheDir,
+                          "Nota_Mesclada_" +
+                              "${System.currentTimeMillis()}.m4a"
+                      )
+
+                  try {
+
+                      outputFile.delete()
+
+                      /*
+                       * Primeiro tentamos o modo rápido.
+                       */
+                      val fastSuccess =
+                          tryFastMerge(
+                              context =
+                                  context,
+
+                              audioList =
+                                  audioList,
+
+                              outputFile =
+                                  outputFile,
+
+                              totalDurationMs =
+                                  totalDurationMs,
+
+                              onProgress =
+                                  onProgress
+                          )
+
+                      if (
+                          fastSuccess &&
+                          outputFile.exists() &&
+                          outputFile.length() > 0L
+                      ) {
+
+                          onProgress(
+                              1f,
+                              totalDurationMs ?: 0L,
+                              totalDurationMs,
+                              "Concluído rapidamente"
+                          )
+
+                          return@withContext MergeResult(
+                              file = outputFile,
+                              mode = "Rápido"
+                          )
+                      }
+
+                      /*
+                       * Os arquivos não eram compatíveis com
+                       * cópia direta. Apaga a tentativa parcial
+                       * e usa a forma segura.
+                       */
+                      outputFile.delete()
+
+                      onProgress(
+                          0f,
+                          0L,
+                          totalDurationMs,
+                          "Modo rápido incompatível. " +
+                              "Usando modo compatível..."
+                      )
+
+                      return@withContext compatibleMerge(
+                          audioList =
+                              audioList,
+
+                          outputFile =
+                              outputFile,
+
+                          totalDurationMs =
+                              totalDurationMs,
+
+                          onProgress =
+                              onProgress
                       )
 
                   } catch (e: Throwable) {
@@ -502,30 +933,77 @@ jobs:
           ) : AndroidViewModel(application) {
 
               private val _audioQueue =
-                  MutableStateFlow<List<AudioItem>>(emptyList())
+                  MutableStateFlow<List<AudioItem>>(
+                      emptyList()
+                  )
 
-              val audioQueue: StateFlow<List<AudioItem>> =
+              val audioQueue:
+                  StateFlow<List<AudioItem>> =
                   _audioQueue.asStateFlow()
 
               private val _isProcessing =
                   MutableStateFlow(false)
 
-              val isProcessing: StateFlow<Boolean> =
+              val isProcessing:
+                  StateFlow<Boolean> =
                   _isProcessing.asStateFlow()
+
+              /*
+               * null significa que não conseguimos calcular
+               * uma porcentagem exata.
+               */
+              private val _progress =
+                  MutableStateFlow<Float?>(null)
+
+              val progress:
+                  StateFlow<Float?> =
+                  _progress.asStateFlow()
+
+              private val _processedMs =
+                  MutableStateFlow(0L)
+
+              val processedMs:
+                  StateFlow<Long> =
+                  _processedMs.asStateFlow()
+
+              private val _totalMs =
+                  MutableStateFlow<Long?>(null)
+
+              val totalMs:
+                  StateFlow<Long?> =
+                  _totalMs.asStateFlow()
+
+              private val _phase =
+                  MutableStateFlow("")
+
+              val phase:
+                  StateFlow<String> =
+                  _phase.asStateFlow()
+
+              private val _lastMode =
+                  MutableStateFlow<String?>(null)
+
+              val lastMode:
+                  StateFlow<String?> =
+                  _lastMode.asStateFlow()
 
               private val _errorMessage =
                   MutableStateFlow<String?>(null)
 
-              val errorMessage: StateFlow<String?> =
+              val errorMessage:
+                  StateFlow<String?> =
                   _errorMessage.asStateFlow()
 
               private val _errorDetails =
                   MutableStateFlow<String?>(null)
 
-              val errorDetails: StateFlow<String?> =
+              val errorDetails:
+                  StateFlow<String?> =
                   _errorDetails.asStateFlow()
 
-              fun handleIncomingIntent(intent: Intent?) {
+              fun handleIncomingIntent(
+                  intent: Intent?
+              ) {
 
                   if (intent == null) {
                       return
@@ -535,25 +1013,24 @@ jobs:
 
                       Intent.ACTION_SEND -> {
 
-                          val uri =
-                              getSingleUri(intent)
-
-                          if (uri != null) {
-                              addUri(uri)
+                          getSingleUri(intent)?.let {
+                              addUri(it)
                           }
                       }
 
                       Intent.ACTION_SEND_MULTIPLE -> {
 
                           getMultipleUris(intent)
-                              .forEach { uri ->
-                                  addUri(uri)
+                              .forEach {
+                                  addUri(it)
                               }
                       }
                   }
               }
 
-              private fun addUri(uri: Uri) {
+              private fun addUri(
+                  uri: Uri
+              ) {
 
                   viewModelScope.launch {
 
@@ -575,7 +1052,8 @@ jobs:
                       } else {
 
                           _errorMessage.value =
-                              "Não foi possível abrir um dos áudios."
+                              "Não foi possível abrir " +
+                                  "um dos áudios."
                       }
                   }
               }
@@ -597,6 +1075,7 @@ jobs:
                   } else {
 
                       @Suppress("DEPRECATION")
+
                       intent.getParcelableExtra(
                           Intent.EXTRA_STREAM
                       )
@@ -620,6 +1099,7 @@ jobs:
                   } else {
 
                       @Suppress("DEPRECATION")
+
                       intent.getParcelableArrayListExtra<Uri>(
                           Intent.EXTRA_STREAM
                       ) ?: emptyList()
@@ -652,7 +1132,8 @@ jobs:
                   }
 
                   val list =
-                      _audioQueue.value.toMutableList()
+                      _audioQueue.value
+                          .toMutableList()
 
                   if (
                       fromIndex !in list.indices ||
@@ -662,14 +1143,17 @@ jobs:
                   }
 
                   val item =
-                      list.removeAt(fromIndex)
+                      list.removeAt(
+                          fromIndex
+                      )
 
                   list.add(
                       toIndex,
                       item
                   )
 
-                  _audioQueue.value = list
+                  _audioQueue.value =
+                      list
               }
 
               fun clearQueue() {
@@ -678,15 +1162,25 @@ jobs:
                       return
                   }
 
-                  _audioQueue.value.forEach {
-                      it.file.delete()
-                  }
+                  _audioQueue.value
+                      .forEach {
+                          it.file.delete()
+                      }
 
                   _audioQueue.value =
                       emptyList()
 
-                  _errorMessage.value = null
-                  _errorDetails.value = null
+                  _errorMessage.value =
+                      null
+
+                  _errorDetails.value =
+                      null
+
+                  _progress.value =
+                      null
+
+                  _lastMode.value =
+                      null
               }
 
               fun dismissError() {
@@ -710,8 +1204,26 @@ jobs:
 
                   viewModelScope.launch {
 
-                      _isProcessing.value = true
-                      _errorDetails.value = null
+                      _isProcessing.value =
+                          true
+
+                      _progress.value =
+                          0f
+
+                      _processedMs.value =
+                          0L
+
+                      _totalMs.value =
+                          null
+
+                      _phase.value =
+                          "Preparando..."
+
+                      _lastMode.value =
+                          null
+
+                      _errorDetails.value =
+                          null
 
                       try {
 
@@ -719,9 +1231,37 @@ jobs:
                               AudioMerger.mergeAudios(
                                   getApplication(),
                                   _audioQueue.value
-                              )
+                              ) {
+                                  progress,
+                                  processed,
+                                  total,
+                                  phase ->
 
-                          if (result.file != null) {
+                                  _progress.value =
+                                      progress
+
+                                  _processedMs.value =
+                                      processed
+
+                                  _totalMs.value =
+                                      total
+
+                                  _phase.value =
+                                      phase
+                              }
+
+                          if (
+                              result.file != null
+                          ) {
+
+                              _progress.value =
+                                  1f
+
+                              _phase.value =
+                                  "Concluído"
+
+                              _lastMode.value =
+                                  result.mode
 
                               onComplete(
                                   result.file
@@ -795,6 +1335,7 @@ jobs:
           import androidx.compose.material3.ExperimentalMaterial3Api
           import androidx.compose.material3.Icon
           import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
           import androidx.compose.material3.MaterialTheme
           import androidx.compose.material3.Scaffold
           import androidx.compose.material3.Surface
@@ -812,8 +1353,10 @@ jobs:
           import androidx.compose.ui.unit.dp
           import androidx.core.content.FileProvider
           import java.io.File
+          import java.util.Locale
 
-          class MainActivity : ComponentActivity() {
+          class MainActivity :
+              ComponentActivity() {
 
               private val viewModel:
                   AudioViewModel by viewModels()
@@ -822,11 +1365,14 @@ jobs:
                   savedInstanceState: Bundle?
               ) {
 
-                  super.onCreate(savedInstanceState)
-
-                  viewModel.handleIncomingIntent(
-                      intent
+                  super.onCreate(
+                      savedInstanceState
                   )
+
+                  viewModel
+                      .handleIncomingIntent(
+                          intent
+                      )
 
                   setContent {
 
@@ -854,13 +1400,18 @@ jobs:
                   intent: Intent
               ) {
 
-                  super.onNewIntent(intent)
-
-                  setIntent(intent)
-
-                  viewModel.handleIncomingIntent(
+                  super.onNewIntent(
                       intent
                   )
+
+                  setIntent(
+                      intent
+                  )
+
+                  viewModel
+                      .handleIncomingIntent(
+                          intent
+                      )
               }
 
               private fun shareResult(
@@ -879,7 +1430,8 @@ jobs:
                           Intent.ACTION_SEND
                       ).apply {
 
-                          type = "audio/mp4"
+                          type =
+                              "audio/mp4"
 
                           putExtra(
                               Intent.EXTRA_STREAM,
@@ -906,6 +1458,46 @@ jobs:
               }
           }
 
+          private fun formatTime(
+              milliseconds: Long
+          ): String {
+
+              val seconds =
+                  milliseconds
+                      .coerceAtLeast(0L) /
+                      1000L
+
+              val hours =
+                  seconds / 3600L
+
+              val minutes =
+                  (seconds % 3600L) /
+                      60L
+
+              val secs =
+                  seconds % 60L
+
+              return if (hours > 0L) {
+
+                  String.format(
+                      Locale.getDefault(),
+                      "%d:%02d:%02d",
+                      hours,
+                      minutes,
+                      secs
+                  )
+
+              } else {
+
+                  String.format(
+                      Locale.getDefault(),
+                      "%02d:%02d",
+                      minutes,
+                      secs
+                  )
+              }
+          }
+
           @OptIn(
               ExperimentalMaterial3Api::class
           )
@@ -921,6 +1513,22 @@ jobs:
 
               val isProcessing by
                   viewModel.isProcessing
+                      .collectAsState()
+
+              val progress by
+                  viewModel.progress
+                      .collectAsState()
+
+              val processedMs by
+                  viewModel.processedMs
+                      .collectAsState()
+
+              val totalMs by
+                  viewModel.totalMs
+                      .collectAsState()
+
+              val phase by
+                  viewModel.phase
                       .collectAsState()
 
               val errorMessage by
@@ -955,9 +1563,11 @@ jobs:
 
                           TextButton(
                               onClick = {
-                                  viewModel.dismissError()
+                                  viewModel
+                                      .dismissError()
                               }
                           ) {
+
                               Text("OK")
                           }
                       }
@@ -973,6 +1583,7 @@ jobs:
                       },
 
                       title = {
+
                           Text(
                               "Falha na mesclagem"
                           )
@@ -984,12 +1595,14 @@ jobs:
 
                               Text(
                                   text =
-                                      errorDetails ?: "",
+                                      errorDetails
+                                          ?: "",
 
                                   modifier =
                                       Modifier
                                           .heightIn(
-                                              max = 420.dp
+                                              max =
+                                                  420.dp
                                           )
                                           .verticalScroll(
                                               rememberScrollState()
@@ -1022,12 +1635,15 @@ jobs:
 
                           TextButton(
                               onClick = {
+
                                   viewModel
                                       .dismissErrorDetails()
                               }
                           ) {
 
-                              Text("Fechar")
+                              Text(
+                                  "Fechar"
+                              )
                           }
                       }
                   )
@@ -1038,11 +1654,12 @@ jobs:
                   topBar = {
 
                       TopAppBar(
+
                           title = {
 
                               Text(
                                   "Fila de Áudios " +
-                                  "(${audioList.size})"
+                                      "(${audioList.size})"
                               )
                           },
 
@@ -1055,12 +1672,16 @@ jobs:
 
                                   IconButton(
                                       onClick = {
-                                          viewModel.clearQueue()
+
+                                          viewModel
+                                              .clearQueue()
                                       }
                                   ) {
 
                                       Icon(
-                                          Icons.Default.Delete,
+                                          Icons.Default
+                                              .Delete,
+
                                           contentDescription =
                                               "Limpar fila"
                                       )
@@ -1081,12 +1702,124 @@ jobs:
                                   8.dp
                           ) {
 
-                              Row(
+                              Column(
                                   modifier =
                                       Modifier
                                           .fillMaxWidth()
-                                          .padding(16.dp)
+                                          .padding(
+                                              16.dp
+                                          )
                               ) {
+
+                                  /*
+                                   * BARRA DE PROGRESSO
+                                   */
+                                  if (isProcessing) {
+
+                                      Text(
+                                          text =
+                                              phase.ifBlank {
+                                                  "Mesclando..."
+                                              },
+
+                                          style =
+                                              MaterialTheme
+                                                  .typography
+                                                  .bodyMedium
+                                      )
+
+                                      Spacer(
+                                          modifier =
+                                              Modifier
+                                                  .width(
+                                                      8.dp
+                                                  )
+                                      )
+
+                                      if (
+                                          progress != null
+                                      ) {
+
+                                          LinearProgressIndicator(
+                                              progress =
+                                                  progress!!
+                                                      .coerceIn(
+                                                          0f,
+                                                          1f
+                                                      ),
+
+                                              modifier =
+                                                  Modifier
+                                                      .fillMaxWidth()
+                                                      .padding(
+                                                          vertical =
+                                                              8.dp
+                                                      )
+                                          )
+
+                                          val percent =
+                                              (
+                                                  progress!! *
+                                                      100f
+                                              )
+                                                  .toInt()
+                                                  .coerceIn(
+                                                      0,
+                                                      100
+                                                  )
+
+                                          Row(
+                                              modifier =
+                                                  Modifier
+                                                      .fillMaxWidth(),
+
+                                              horizontalArrangement =
+                                                  Arrangement
+                                                      .SpaceBetween
+                                          ) {
+
+                                              Text(
+                                                  "$percent%"
+                                              )
+
+                                              if (
+                                                  totalMs !=
+                                                  null
+                                              ) {
+
+                                                  Text(
+                                                      formatTime(
+                                                          processedMs
+                                                      ) +
+                                                          " / " +
+                                                          formatTime(
+                                                              totalMs!!
+                                                          )
+                                                  )
+                                              }
+                                          }
+
+                                      } else {
+
+                                          LinearProgressIndicator(
+                                              modifier =
+                                                  Modifier
+                                                      .fillMaxWidth()
+                                                      .padding(
+                                                          vertical =
+                                                              8.dp
+                                                      )
+                                          )
+                                      }
+
+                                      Spacer(
+                                          modifier =
+                                              Modifier
+                                                  .width(
+                                                      8.dp
+                                                  )
+                                      )
+                                  }
 
                                   Button(
                                       modifier =
@@ -1103,7 +1836,8 @@ jobs:
                                                   result ->
 
                                                   if (
-                                                      result != null
+                                                      result !=
+                                                      null
                                                   ) {
 
                                                       onShareResult(
@@ -1144,7 +1878,9 @@ jobs:
                                       } else {
 
                                           Icon(
-                                              Icons.Default.Check,
+                                              Icons.Default
+                                                  .Check,
+
                                               contentDescription =
                                                   null
                                           )
@@ -1177,8 +1913,12 @@ jobs:
                           modifier =
                               Modifier
                                   .fillMaxSize()
-                                  .padding(padding)
-                                  .padding(32.dp),
+                                  .padding(
+                                      padding
+                                  )
+                                  .padding(
+                                      32.dp
+                                  ),
 
                           contentAlignment =
                               Alignment.Center
@@ -1187,10 +1927,10 @@ jobs:
                           Text(
                               text =
                                   "Nenhum áudio na fila.\n\n" +
-                                  "Selecione um ou vários " +
-                                  "áudios em outro aplicativo " +
-                                  "e use Compartilhar → " +
-                                  "Mesclador de Áudio.",
+                                      "Selecione um ou vários " +
+                                      "áudios em outro aplicativo " +
+                                      "e use Compartilhar → " +
+                                      "Mesclador de Áudio.",
 
                               style =
                                   MaterialTheme
@@ -1205,7 +1945,9 @@ jobs:
                           modifier =
                               Modifier
                                   .fillMaxSize()
-                                  .padding(padding)
+                                  .padding(
+                                      padding
+                                  )
                                   .padding(
                                       horizontal =
                                           16.dp
@@ -1263,7 +2005,9 @@ jobs:
                                       Column(
                                           modifier =
                                               Modifier
-                                                  .weight(1f)
+                                                  .weight(
+                                                      1f
+                                                  )
                                       ) {
 
                                           Text(
@@ -1292,7 +2036,8 @@ jobs:
                                                   viewModel
                                                       .moveAudio(
                                                           index,
-                                                          index - 1
+                                                          index -
+                                                              1
                                                       )
                                               }
                                           ) {
@@ -1322,7 +2067,8 @@ jobs:
                                                   viewModel
                                                       .moveAudio(
                                                           index,
-                                                          index + 1
+                                                          index +
+                                                              1
                                                       )
                                               }
                                           ) {
@@ -1351,7 +2097,8 @@ jobs:
                                       ) {
 
                                           Icon(
-                                              Icons.Default.Close,
+                                              Icons.Default
+                                                  .Close,
 
                                               contentDescription =
                                                   "Remover"
@@ -1380,7 +2127,7 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AudioMerger-APK-v1.1
+          name: AudioMerger-APK-v1.2
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
