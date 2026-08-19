@@ -1,0 +1,524 @@
+name: Build AudioMerger APK
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Project Files
+        run: |
+          mkdir -p app/src/main/java/com/example/audiomerger
+          mkdir -p app/src/main/res/xml
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AudioMerger"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.audiomerger"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.audiomerger"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.8"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+              implementation("com.arthenica:ffmpeg-kit-audio:6.0-2")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Mesclador de Áudio"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="audio/*" />
+                      </intent-filter>
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND_MULTIPLE" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="audio/*" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/file_paths.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="cached_audio" path="." />
+          </paths>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/audiomerger/AudioMerger.kt
+          package com.example.audiomerger
+
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import com.arthenica.ffmpegkit.FFmpegKit
+          import com.arthenica.ffmpegkit.ReturnCode
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+
+          data class AudioItem(
+              val id: String = java.util.UUID.randomUUID().toString(),
+              val name: String,
+              val file: File
+          )
+
+          object AudioMerger {
+
+              fun copyUriToCache(context: Context, uri: Uri): AudioItem? {
+                  return try {
+                      var fileName = "audio_${System.currentTimeMillis()}"
+                      context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                          val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (nameIndex != -1 && cursor.moveToFirst()) {
+                              fileName = cursor.getString(nameIndex)
+                          }
+                      }
+
+                      val destinationFile = File(context.cacheDir, "input_${System.currentTimeMillis()}_$fileName")
+                      context.contentResolver.openInputStream(uri)?.use { input ->
+                          FileOutputStream(destinationFile).use { output ->
+                              input.copyTo(output)
+                          }
+                      }
+                      AudioItem(name = fileName, file = destinationFile)
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                      null
+                  }
+              }
+
+              suspend fun mergeAudios(context: Context, audioList: List<AudioItem>): File? = withContext(Dispatchers.IO) {
+                  if (audioList.isEmpty()) return@withContext null
+                  if (audioList.size == 1) return@withContext audioList.first().file
+
+                  val outputFile = File(context.cacheDir, "Nota_Mesclada_${System.currentTimeMillis()}.m4a")
+
+                  val inputArgs = StringBuilder()
+                  val filterArgs = StringBuilder()
+
+                  audioList.forEachIndexed { index, item ->
+                      inputArgs.append("-i \"${item.file.absolutePath}\" ")
+                      filterArgs.append("[$index:a]")
+                  }
+
+                  filterArgs.append("concat=n=${audioList.size}:v=0:a=1[outa]")
+
+                  val cmd = "$inputArgs -filter_complex \"$filterArgs\" -map \"[outa]\" -c:a aac -b:a 192k -ar 44100 \"${outputFile.absolutePath}\""
+
+                  val session = FFmpegKit.execute(cmd)
+                  if (ReturnCode.isSuccess(session.returnCode)) {
+                      outputFile
+                  } else {
+                      null
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/audiomerger/AudioViewModel.kt
+          package com.example.audiomerger
+
+          import android.app.Application
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.launch
+          import java.io.File
+
+          class AudioViewModel(application: Application) : AndroidViewModel(application) {
+
+              private val _audioQueue = MutableStateFlow<List<AudioItem>>(emptyList())
+              val audioQueue: StateFlow<List<AudioItem>> = _audioQueue.asStateFlow()
+
+              private val _isProcessing = MutableStateFlow(false)
+              val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
+
+              private val _mergedFile = MutableStateFlow<File?>(null)
+              val mergedFile: StateFlow<File?> = _mergedFile.asStateFlow()
+
+              fun handleIncomingIntent(intent: Intent?) {
+                  if (intent == null) return
+                  val context = getApplication<Application>().applicationContext
+
+                  when (intent.action) {
+                      Intent.ACTION_SEND -> {
+                          val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                              intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                          } else {
+                              @Suppress("DEPRECATION")
+                              intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                          }
+                          uri?.let {
+                              AudioMerger.copyUriToCache(context, it)?.let { item ->
+                                  _audioQueue.value = _audioQueue.value + item
+                              }
+                          }
+                      }
+                      Intent.ACTION_SEND_MULTIPLE -> {
+                          val uris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                              intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                          } else {
+                              @Suppress("DEPRECATION")
+                              intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                          }
+                          uris?.forEach { uri ->
+                              AudioMerger.copyUriToCache(context, uri)?.let { item ->
+                                  _audioQueue.value = _audioQueue.value + item
+                              }
+                          }
+                      }
+                  }
+              }
+
+              fun removeAudio(item: AudioItem) {
+                  _audioQueue.value = _audioQueue.value.filter { it.id != item.id }
+                  item.file.delete()
+              }
+
+              fun moveAudio(fromIndex: Int, toIndex: Int) {
+                  val list = _audioQueue.value.toMutableList()
+                  val item = list.removeAt(fromIndex)
+                  list.add(toIndex, item)
+                  _audioQueue.value = list
+              }
+
+              fun clearQueue() {
+                  _audioQueue.value.forEach { it.file.delete() }
+                  _audioQueue.value = emptyList()
+                  _mergedFile.value = null
+              }
+
+              fun processMerge(onComplete: (File?) -> Unit) {
+                  viewModelScope.launch {
+                      _isProcessing.value = true
+                      val output = AudioMerger.mergeAudios(getApplication(), _audioQueue.value)
+                      _mergedFile.value = output
+                      _isProcessing.value = false
+                      onComplete(output)
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/audiomerger/MainActivity.kt
+          package com.example.audiomerger
+
+          import android.content.Intent
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.viewModels
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.FileProvider
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+
+              private val viewModel: AudioViewModel by viewModels()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  viewModel.handleIncomingIntent(intent)
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              AudioMergerScreen(
+                                  viewModel = viewModel,
+                                  onShareResult = { file -> shareToSamsungNotes(file) }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  viewModel.handleIncomingIntent(intent)
+              }
+
+              private fun shareToSamsungNotes(file: File) {
+                  val uri = FileProvider.getUriForFile(
+                      this,
+                      "${applicationContext.packageName}.fileprovider",
+                      file
+                  )
+
+                  val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                      type = "audio/mp4"
+                      putExtra(Intent.EXTRA_STREAM, uri)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  }
+
+                  startActivity(Intent.createChooser(shareIntent, "Enviar para Samsung Notes"))
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun AudioMergerScreen(
+              viewModel: AudioViewModel,
+              onShareResult: (File) -> Unit
+          ) {
+              val audioList by viewModel.audioQueue.collectAsState()
+              val isProcessing by viewModel.isProcessing.collectAsState()
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("Fila de Áudios (${audioList.size})") },
+                          actions = {
+                              if (audioList.isNotEmpty()) {
+                                  IconButton(onClick = { viewModel.clearQueue() }) {
+                                      Icon(Icons.Default.DeleteSweep, contentDescription = "Limpar Fila")
+                                  }
+                              }
+                          }
+                      )
+                  },
+                  bottomBar = {
+                      if (audioList.isNotEmpty()) {
+                          Surface(tonalElevation = 8.dp) {
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .padding(16.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(12.dp)
+                              ) {
+                                  Button(
+                                      modifier = Modifier.weight(1f),
+                                      enabled = !isProcessing,
+                                      onClick = {
+                                          viewModel.processMerge { result ->
+                                              if (result != null) {
+                                                  onShareResult(result)
+                                              }
+                                          }
+                                      }
+                                  ) {
+                                      if (isProcessing) {
+                                          CircularProgressIndicator(
+                                              modifier = Modifier.size(20.dp),
+                                              color = MaterialTheme.colorScheme.onPrimary
+                                          )
+                                          Spacer(modifier = Modifier.width(8.dp))
+                                          Text("Mesclando...")
+                                      } else {
+                                          Icon(Icons.Default.Merge, contentDescription = null)
+                                          Spacer(modifier = Modifier.width(8.dp))
+                                          Text("Mesclar em .m4a")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              ) { padding ->
+                  if (audioList.isEmpty()) {
+                      Box(
+                          modifier = Modifier
+                              .fillMaxSize()
+                              .padding(padding),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text(
+                              text = "Nenhum áudio na fila.\nCompartilhe áudios de outros apps para adicioná-los aqui.",
+                              style = MaterialTheme.typography.bodyLarge,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                      }
+                  } else {
+                      LazyColumn(
+                          modifier = Modifier
+                              .fillMaxSize()
+                              .padding(padding)
+                              .padding(horizontal = 16.dp),
+                          verticalArrangement = Arrangement.spacedBy(8.dp)
+                      ) {
+                          itemsIndexed(audioList, key = { _, item -> item.id }) { index, item ->
+                              Card(modifier = Modifier.fillMaxWidth()) {
+                                  Row(
+                                      modifier = Modifier
+                                          .fillMaxWidth()
+                                          .padding(12.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Text(
+                                          text = "${index + 1}.",
+                                          style = MaterialTheme.typography.titleMedium,
+                                          modifier = Modifier.width(28.dp)
+                                      )
+                                      Column(modifier = Modifier.weight(1f)) {
+                                          Text(
+                                              text = item.name,
+                                              style = MaterialTheme.typography.bodyMedium
+                                          )
+                                      }
+                                      if (index > 0) {
+                                          IconButton(onClick = { viewModel.moveAudio(index, index - 1) }) {
+                                              Icon(Icons.Default.ArrowUpward, contentDescription = "Subir")
+                                          }
+                                      }
+                                      if (index < audioList.size - 1) {
+                                          IconButton(onClick = { viewModel.moveAudio(index, index + 1) }) {
+                                              Icon(Icons.Default.ArrowDownward, contentDescription = "Descer")
+                                          }
+                                      }
+                                      IconButton(onClick = { viewModel.removeAudio(item) }) {
+                                          Icon(Icons.Default.Close, contentDescription = "Remover")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: |
+          gradle wrapper --gradle-version 8.4
+          chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioMerger-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
