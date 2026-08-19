@@ -19,13 +19,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.4'
+          cache-disabled: true
 
       - name: Create Project Files
         run: |
@@ -94,6 +92,11 @@ jobs:
               composeOptions {
                   kotlinCompilerExtensionVersion = "1.5.8"
               }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
           }
 
           dependencies {
@@ -103,9 +106,8 @@ jobs:
               implementation(platform("androidx.compose:compose-bom:2024.02.00"))
               implementation("androidx.compose.ui:ui")
               implementation("androidx.compose.material3:material3")
-              implementation("androidx.compose.material:material-icons-extended")
               implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
-              implementation("com.arthenica:ffmpeg-kit-audio:6.0-2")
+              implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:6.0-2")
           }
           EOF
 
@@ -405,7 +407,7 @@ jobs:
                           actions = {
                               if (audioList.isNotEmpty()) {
                                   IconButton(onClick = { viewModel.clearQueue() }) {
-                                      Icon(Icons.Default.DeleteSweep, contentDescription = "Limpar Fila")
+                                      Icon(Icons.Default.Delete, contentDescription = "Limpar Fila")
                                   }
                               }
                           }
@@ -439,7 +441,7 @@ jobs:
                                           Spacer(modifier = Modifier.width(8.dp))
                                           Text("Mesclando...")
                                       } else {
-                                          Icon(Icons.Default.Merge, contentDescription = null)
+                                          Icon(Icons.Default.Check, contentDescription = null)
                                           Spacer(modifier = Modifier.width(8.dp))
                                           Text("Mesclar em .m4a")
                                       }
@@ -491,12 +493,12 @@ jobs:
                                       }
                                       if (index > 0) {
                                           IconButton(onClick = { viewModel.moveAudio(index, index - 1) }) {
-                                              Icon(Icons.Default.ArrowUpward, contentDescription = "Subir")
+                                              Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Subir")
                                           }
                                       }
                                       if (index < audioList.size - 1) {
                                           IconButton(onClick = { viewModel.moveAudio(index, index + 1) }) {
-                                              Icon(Icons.Default.ArrowDownward, contentDescription = "Descer")
+                                              Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Descer")
                                           }
                                       }
                                       IconButton(onClick = { viewModel.removeAudio(item) }) {
